@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trump Apples</title>
+<style>
+  :root{
+    --fg: #39ff6a;
+    --fg-dim: #1f7a3a;
+    --border: #1f4a2c;
+    --panel: rgba(10,13,10,0.85);
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  #stage{
+    width:100vw; height:100vh; display:flex; align-items:center; justify-content:center;
+  }
+  #gridCanvas{ display:block; }
+
+  #overlay{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#000; color:var(--fg); z-index:10; text-align:center; cursor:pointer;
+  }
+  #overlay.hidden{ display:none; }
+  #overlay h1{ font-size:16px; letter-spacing:0.06em; margin:0 0 8px; font-weight:600; }
+  #overlay p{ font-size:12px; color:var(--fg-dim); margin:0; }
+  #overlay.error{ cursor:default; }
+  #overlay.error h1{ color:#ff5c5c; }
+
+  #bar{
+    position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; padding:8px 14px;
+    background:var(--panel); border:1px solid var(--border); border-radius:3px;
+    color:var(--fg); font-size:12px; z-index:5; opacity:0.55; transition:opacity 0.15s;
+  }
+  #bar.hidden{ display:none; }
+  #bar:hover{ opacity:1; }
+  #bar button{
+    background:transparent; border:1px solid var(--fg-dim); color:var(--fg);
+    padding:5px 12px; font-family:inherit; font-size:12px; cursor:pointer; border-radius:2px;
+  }
+  #bar button:hover{ border-color:var(--fg); }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="gridCanvas"></canvas>
+</div>
+
+<div id="overlay">
+  <div>
+    <h1 id="overlayTitle">Trump Apples</h1>
+    <p id="overlayText">loading…</p>
+  </div>
+</div>
+
+<div id="bar" class="hidden">
+  <button id="pauseBtn">pause</button>
+  <button id="restartBtn">restart</button>
+  <span id="recIndicator" style="display:none;color:#ff5c5c;">● rec</span>
+</div>
+
+<audio id="audio" src="audio.mp4" preload="auto"></audio>
+
+<script>
+(() => {
+  const COLS = 40, ROWS = 30;
+  const FALLBACK_DURATION_SECONDS = 3 * 60 + 39; // 3:39, used only if audio.duration is unavailable
+
+  const canvas = document.getElementById('gridCanvas');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const overlayTitle = document.getElementById('overlayTitle');
+  const overlayText = document.getElementById('overlayText');
+  const bar = document.getElementById('bar');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const restartBtn = document.getElementById('restartBtn');
+  const audio = document.getElementById('audio');
+  const recIndicator = document.getElementById('recIndicator');
+
+  let frames = [];       // string[], each COLS*ROWS chars, row-major ('*' = black, else white)
+  let blackImg = null;
+  let whiteImg = null;
+  let fps = 30;
+  let lastDrawnIndex = -1;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let recordingStarted = false;
+
+  function showError(message) {
+    overlay.classList.remove('hidden');
+    overlay.classList.add('error');
+    overlayTitle.textContent = 'Trump Apples';
+    overlayText.textContent = message;
+    bar.classList.add('hidden');
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('could not load ' + src));
+      img.src = src;
+    });
+  }
+
+  function loadAudioMetadata() {
+    return new Promise((resolve, reject) => {
+      if (audio.readyState >= 1) return resolve();
+      audio.addEventListener('loadedmetadata', () => resolve(), { once: true });
+      audio.addEventListener('error', () => reject(new Error('could not load audio.mp4')), { once: true });
+    });
+  }
+
+  function parseFrames(text) {
+    return text.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.length > 0);
+  }
+
+  function resizeCanvas() {
+    const cell = Math.max(1, Math.floor(Math.min(window.innerWidth / COLS, window.innerHeight / ROWS)));
+    canvas.width = cell * COLS;
+    canvas.height = cell * ROWS;
+    lastDrawnIndex = -1; // force redraw at new size
+  }
+
+  function drawFrame(i) {
+    if (i === lastDrawnIndex) return;
+    const frame = frames[i];
+    if (!frame) return;
+    const cell = canvas.width / COLS;
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const img = frame[r * COLS + c] === '*' ? blackImg : whiteImg;
+        ctx.drawImage(img, c * cell, r * cell, cell, cell);
+      }
+    }
+    lastDrawnIndex = i;
+  }
+
+  function renderLoop() {
+    const t = Math.min(audio.currentTime, (frames.length - 1) / fps);
+    const idx = Math.max(0, Math.min(frames.length - 1, Math.floor(t * fps)));
+    drawFrame(idx);
+    requestAnimationFrame(renderLoop);
+  }
+
+  function pickMimeType() {
+    const candidates = [
+      'video/mp4;codecs=h264,aac',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  }
+
+  // Records the canvas + the audio element's own track from the moment playback truly
+  // starts, and auto-downloads the result once the audio ends. Runs once per page load.
+  function startRecording() {
+    if (recordingStarted) return;
+    if (!canvas.captureStream || !window.MediaRecorder) return; // unsupported browser, skip quietly
+    recordingStarted = true;
+    try {
+      const vStream = canvas.captureStream(Math.max(1, Math.round(fps)));
+      let aTracks = [];
+      const captureAudio = audio.captureStream || audio.mozCaptureStream;
+      if (captureAudio) {
+        aTracks = captureAudio.call(audio).getAudioTracks();
+      }
+      const combined = new MediaStream([...vStream.getVideoTracks(), ...aTracks]);
+      const mimeType = pickMimeType();
+      mediaRecorder = mimeType ? new MediaRecorder(combined, { mimeType }) : new MediaRecorder(combined);
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = saveRecording;
+      mediaRecorder.start();
+      if (recIndicator) recIndicator.style.display = 'inline';
+    } catch (e) {
+      recordingStarted = false;
+      console.warn('recording unavailable:', e);
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  }
+
+  function saveRecording() {
+    if (recIndicator) recIndicator.style.display = 'none';
+    if (!recordedChunks.length) return;
+    const mimeType = mediaRecorder.mimeType || 'video/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'trump-apples.' + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  audio.addEventListener('ended', stopRecording);
+
+  async function begin() {
+    try {
+      const [text, black, white] = await Promise.all([
+        fetch('frames.txt').then(r => { if (!r.ok) throw new Error('frames.txt ' + r.status); return r.text(); }),
+        loadImage('black.jpg'),
+        loadImage('white.jpg'),
+        loadAudioMetadata()
+      ]);
+      frames = parseFrames(text);
+      blackImg = black;
+      whiteImg = white;
+
+      if (frames.length === 0) throw new Error('frames.txt had no frames');
+
+      const duration = (isFinite(audio.duration) && audio.duration > 0) ? audio.duration : FALLBACK_DURATION_SECONDS;
+      fps = frames.length / duration;
+
+      window.addEventListener('resize', resizeCanvas);
+      resizeCanvas();
+      drawFrame(0);
+      requestAnimationFrame(renderLoop);
+
+      bar.classList.remove('hidden');
+      tryAutoplay();
+    } catch (e) {
+      showError('something went wrong loading this — ' + e.message);
+    }
+  }
+
+  function tryAutoplay() {
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.then(() => {
+        overlay.classList.add('hidden');
+        startRecording();
+      }).catch(() => {
+        overlay.classList.remove('hidden');
+        overlay.classList.remove('error');
+        overlayTitle.textContent = 'Trump Apples';
+        overlayText.textContent = 'click to start';
+        overlay.addEventListener('click', startFromGesture, { once: true });
+      });
+    } else {
+      overlay.classList.add('hidden');
+    }
+  }
+
+  function startFromGesture() {
+    audio.play();
+    overlay.classList.add('hidden');
+    startRecording();
+  }
+
+  pauseBtn.addEventListener('click', () => {
+    if (audio.paused) {
+      audio.play();
+      pauseBtn.textContent = 'pause';
+    } else {
+      audio.pause();
+      pauseBtn.textContent = 'play';
+    }
+  });
+
+  restartBtn.addEventListener('click', () => {
+    audio.currentTime = 0;
+    audio.play();
+    pauseBtn.textContent = 'pause';
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !bar.classList.contains('hidden')) {
+      e.preventDefault();
+      pauseBtn.click();
+    }
+  });
+
+  begin();
+})();
+</script>
+</body>
+</html>
